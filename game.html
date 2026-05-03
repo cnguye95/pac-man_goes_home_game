@@ -1,0 +1,1053 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pac-Man Parachute</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      background: #000;
+      overflow: hidden;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+
+  <script>
+    // ─── Constants ────────────────────────────────────────────────────────────
+    const LANE_COUNT  = 5;
+    const CANVAS_BG   = '#0a0a1a';
+    const PAC_RADIUS  = 28;
+    const PAC_COLOR   = '#FFE000';
+    const MOUTH_MIN   = 0.05 * Math.PI;  // nearly closed
+    const MOUTH_MAX   = 0.25 * Math.PI;  // wide open
+    const MOUTH_SPEED     = 4.0;         // radians per second
+    const TWEEN_DURATION  = 0.10;        // seconds for lane-switch tween (~100ms)
+
+    // Rain fall speed ramps over the run; named here for clarity, used in getDifficultyParams().
+    // Step 0 (0:00–0:30) is calibrated to match the pre-ramp baseline difficulty.
+    const RAIN_SPEED_EASY_START = 210;   // px/s at 0:00 (easy) — matches old Phase 1
+    const RAIN_SPEED_EASY_END   = 250;   // px/s at 5:00 (easy)
+    const RAIN_SPEED_HARD_START = 280;   // px/s at 0:00 (hard) — matches old Phase 1
+    const RAIN_SPEED_HARD_END   = 340;   // px/s at 5:00 (hard)
+    const RAIN_WIDTH      = 11;          // droplet width in pixels
+    const RAIN_HEIGHT     = 24;          // droplet height in pixels
+    const RAIN_COLOR      = '#7FFF00';   // acid green
+    const RAIN_GLOW       = '#00FF40';   // glow color for shadowBlur
+    // Wave interval and lane counts are set per-difficulty in getDifficultyParams()
+    const HIT_HALF        = PAC_RADIUS * 0.78;  // collision half-size; slightly inside visual edge for fairness
+    const SCORE_RATE      = 1000 / 60;          // points per second (1000 pts/min)
+    const WIN_SCORE       = 5000;
+
+    // Polish: parallax clouds and death particles
+    const CLOUD_SPEED            = 28;          // px/s downward (slow, behind rain)
+    const CLOUD_SPAWN_INTERVAL   = 2.4;         // seconds between new clouds at top
+    const CLOUD_TARGET_COUNT     = 6;           // initial population
+    const PARTICLE_COUNT_ON_DIE  = 28;
+    const PARTICLE_GRAVITY       = 620;         // px/s² for death particles
+    const PARTICLE_LIFE_MIN      = 0.7;         // seconds
+    const PARTICLE_LIFE_MAX      = 1.4;
+
+    // Cherry power-up
+    const CHERRY_FALL_SPEED      = 170;         // px/s, slower than rain so it's catchable
+    const CHERRY_SPAWN_MIN       = 22;          // seconds — guarantees ≥ 20s gap between cherries
+    const CHERRY_SPAWN_MAX       = 34;
+    const CHERRY_RADIUS          = 12;
+    const POWER_UP_DURATION      = 7.5;
+    const POWER_UP_RAIN_BONUS    = 25;
+    const CHERRY_PICKUP_BONUS    = 100;
+
+    // ─── Canvas setup ────────────────────────────────────────────────────────
+    const canvas = document.getElementById('gameCanvas');
+    const ctx    = canvas.getContext('2d');
+
+    function resizeCanvas() {
+      canvas.width  = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    resizeCanvas();
+    window.addEventListener('resize', () => {
+      resizeCanvas();
+      // Recompute lane positions so Pac-Man snaps to the correct lane after resize
+      pacX = tweenFromX = tweenToX = getLaneX(currentLane);
+      tweenT = TWEEN_DURATION;
+    });
+
+    // ─── State ────────────────────────────────────────────────────────────────
+    let mouthAngle  = MOUTH_MAX;
+    let mouthDir    = -1;    // -1 = closing, +1 = opening
+
+    // Lane / tween state (getLaneX is hoisted; canvas.width is set by resizeCanvas above)
+    let currentLane = 2;
+    let pacX        = getLaneX(2);
+    let tweenFromX  = pacX;
+    let tweenToX    = pacX;
+    let tweenT      = TWEEN_DURATION;  // start fully settled
+
+    // Rain state
+    let raindrops     = [];   // each entry: { lane: 0-4, y: pixels }
+    let waveTimer     = 0;    // counts up; spawns a wave when it reaches the difficulty interval
+    let lastSafeLanes = [];   // lanes NOT filled by the previous wave; biases the next wave
+
+    // Game state  ('start' | 'playing' | 'paused' | 'gameover' | 'win')
+    let gameState   = 'start';
+    let elapsedTime = 0;
+    let score       = 0;
+    let difficulty  = 'easy';   // 'easy' | 'hard' — set on the start screen
+
+    // Bounding rects for start-screen buttons (updated each render, read by click handler)
+    let easyBtn = { x: 0, y: 0, w: 0, h: 0 };
+    let hardBtn = { x: 0, y: 0, w: 0, h: 0 };
+    let hoverBtn = null;  // 'easy' | 'hard' | null
+
+    // Polish: parallax clouds and death particles
+    let clouds          = [];   // each: { x, y, r, alpha }
+    let cloudSpawnTimer = 0;
+    let particles       = [];   // each: { x, y, vx, vy, life, maxLife, size }
+    let scorePopups     = [];   // each: { text, x, y, vy, life, maxLife, color }
+
+    // Cherry / power-up state
+    let cherries      = [];     // each: { lane, y }
+    let cherrySpawnIn = 0;      // seconds until next cherry spawns
+    let powerUpTime   = 0;      // seconds remaining of the cherry effect; 0 = inactive
+
+    // ─── Lane geometry ───────────────────────────────────────────────────────
+    function getLaneX(laneIndex) {
+      const laneWidth = canvas.width / LANE_COUNT;
+      return laneWidth * (laneIndex + 0.5);
+    }
+
+    function getPacY() {
+      return canvas.height * 0.65;
+    }
+
+    // ─── Input ────────────────────────────────────────────────────────────────
+    function changeLane(dir) {
+      const newLane = Math.max(0, Math.min(LANE_COUNT - 1, currentLane + dir));
+      if (newLane === currentLane) return;
+      currentLane = newLane;
+      tweenFromX  = pacX;           // tween from wherever we are now (handles mid-tween input)
+      tweenToX    = getLaneX(currentLane);
+      tweenT      = 0;
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft'  && gameState === 'playing') { e.preventDefault(); changeLane(-1); }
+      if (e.key === 'ArrowRight' && gameState === 'playing') { e.preventDefault(); changeLane(+1); }
+      if (e.key === 'p' || e.key === 'P') {
+        if      (gameState === 'playing') gameState = 'paused';
+        else if (gameState === 'paused')  gameState = 'playing';
+      }
+      if (e.key === 'r' || e.key === 'R') {
+        if (gameState === 'gameover') resetGame();         // retry same difficulty
+        if (gameState === 'win')      gameState = 'start'; // choose again after winning
+      }
+      if (e.key === 'm' || e.key === 'M') {
+        if (gameState === 'gameover' || gameState === 'win') gameState = 'start';
+      }
+    });
+
+    // ─── Rain spawner ────────────────────────────────────────────────────────
+    // lanesMin/lanesMax: how many lanes this difficulty phase can fill (e.g. 1–2, 2–3, 3–4)
+    // To force the player to keep moving, we bias each wave to fill at least one lane
+    // that was SAFE in the previous wave. This guarantees consecutive-wave variance.
+    function spawnWave(lanesMin, lanesMax) {
+      const rawCount = lanesMin + Math.floor(Math.random() * (lanesMax - lanesMin + 1));
+      // Explicit guard: no wave may ever fill all 5 lanes, regardless of the random result
+      const count = Math.min(rawCount, LANE_COUNT - 1);
+
+      const filled = [];
+
+      // Strong bias: force as many previously-safe lanes as possible to be filled.
+      // This makes the new safe set disjoint from the old one whenever count >= safeCount,
+      // so a player who doesn't move will be hit with much higher probability.
+      if (lastSafeLanes.length > 0 && count >= 1) {
+        const safeShuffled = [...lastSafeLanes];
+        for (let i = safeShuffled.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [safeShuffled[i], safeShuffled[j]] = [safeShuffled[j], safeShuffled[i]];
+        }
+        const forceCount = Math.min(count, safeShuffled.length);
+        for (let i = 0; i < forceCount; i++) filled.push(safeShuffled[i]);
+      }
+
+      // Fill remaining slots from the rest of the lanes (Fisher-Yates shuffle, take first N)
+      const pool = [0, 1, 2, 3, 4].filter(i => !filled.includes(i));
+      for (let i = pool.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [pool[i], pool[j]] = [pool[j], pool[i]];
+      }
+      while (filled.length < count) {
+        filled.push(pool.shift());
+      }
+
+      for (const lane of filled) {
+        raindrops.push({ lane, y: -RAIN_HEIGHT });
+      }
+
+      // Record which lanes are safe so the next wave can bias against them
+      lastSafeLanes = [0, 1, 2, 3, 4].filter(i => !filled.includes(i));
+    }
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────
+    function formatTime(seconds) {
+      const m = Math.floor(seconds / 60).toString().padStart(2, '0');
+      const s = Math.floor(seconds % 60).toString().padStart(2, '0');
+      return `${m}:${s}`;
+    }
+
+    // ─── Parallax clouds ─────────────────────────────────────────────────────
+    function spawnCloud(initialY) {
+      clouds.push({
+        x:     Math.random() * canvas.width,
+        y:     initialY !== undefined ? initialY : -60,
+        r:     30 + Math.random() * 50,
+        alpha: 0.40 + Math.random() * 0.38,  // bolder, arcade-cloud opacity
+      });
+    }
+
+    function populateClouds() {
+      clouds = [];
+      for (let i = 0; i < CLOUD_TARGET_COUNT; i++) {
+        spawnCloud(Math.random() * canvas.height);
+      }
+      cloudSpawnTimer = 0;
+    }
+
+    function updateClouds(dt) {
+      for (const c of clouds) c.y += CLOUD_SPEED * dt;
+      clouds = clouds.filter(c => c.y - c.r * 1.5 < canvas.height);
+      cloudSpawnTimer += dt;
+      if (cloudSpawnTimer >= CLOUD_SPAWN_INTERVAL) {
+        cloudSpawnTimer -= CLOUD_SPAWN_INTERVAL;
+        spawnCloud();
+      }
+    }
+
+    function drawBackgroundClouds() {
+      for (const c of clouds) {
+        ctx.save();
+        ctx.globalAlpha = c.alpha;
+        drawCloud(c.x, c.y, c.r);
+        ctx.restore();
+      }
+    }
+
+    // ─── Death particles ──────────────────────────────────────────────────────
+    function spawnDeathParticles() {
+      const pacY = getPacY();
+      for (let i = 0; i < PARTICLE_COUNT_ON_DIE; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 120 + Math.random() * 240;
+        particles.push({
+          x: pacX,
+          y: pacY,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed - 80,  // slight upward bias for splash feel
+          life: 0,
+          maxLife: PARTICLE_LIFE_MIN + Math.random() * (PARTICLE_LIFE_MAX - PARTICLE_LIFE_MIN),
+          size: 2 + Math.random() * 3,
+        });
+      }
+    }
+
+    function updateParticles(dt) {
+      for (const p of particles) {
+        p.life += dt;
+        p.vy   += PARTICLE_GRAVITY * dt;
+        p.x    += p.vx * dt;
+        p.y    += p.vy * dt;
+      }
+      particles = particles.filter(p => p.life < p.maxLife);
+    }
+
+    function drawParticles() {
+      for (const p of particles) {
+        const alpha = 1 - p.life / p.maxLife;
+        ctx.save();
+        ctx.shadowColor = RAIN_GLOW;
+        ctx.shadowBlur  = 4;
+        ctx.fillStyle   = `rgba(127, 255, 0, ${alpha.toFixed(3)})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    // ─── Score popups ─────────────────────────────────────────────────────────
+    function spawnScorePopup(text, color) {
+      scorePopups.push({ text, x: 18, y: 44, vy: -48, life: 0, maxLife: 1.1, color });
+    }
+
+    function updateScorePopups(dt) {
+      for (const p of scorePopups) {
+        p.life += dt;
+        p.y    += p.vy * dt;
+      }
+      scorePopups = scorePopups.filter(p => p.life < p.maxLife);
+    }
+
+    function drawScorePopups() {
+      ctx.font         = 'bold 20px monospace';
+      ctx.textBaseline = 'top';
+      ctx.textAlign    = 'left';
+      for (const p of scorePopups) {
+        const alpha = Math.max(0, 1 - p.life / p.maxLife);
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillText(p.text, p.x + 1, p.y + 1);
+        ctx.fillStyle = p.color;
+        ctx.fillText(p.text, p.x, p.y);
+        ctx.restore();
+      }
+    }
+
+    // ─── Background gradient (shifts as the player ascends) ──────────────────
+    function drawBackground() {
+      // 0 = stormy navy (start), 1 = bright daytime sky (near win)
+      const progress = Math.min(elapsedTime / 300, 1);
+      const lerp = (a, b, t) => a + (b - a) * t;
+      const rgb  = (r, g, b) => `rgb(${r|0}, ${g|0}, ${b|0})`;
+
+      // 3-stop sky: top sky / middle haze / bottom storm
+      const top = [
+        lerp(0x1c, 0x5f, progress),
+        lerp(0x2c, 0xb3, progress),
+        lerp(0x4a, 0xe0, progress),
+      ];
+      const mid = [
+        lerp(0x0e, 0x3a, progress),
+        lerp(0x18, 0x78, progress),
+        lerp(0x30, 0xb0, progress),
+      ];
+      const bot = [
+        lerp(0x07, 0x1f, progress),
+        lerp(0x0a, 0x38, progress),
+        lerp(0x14, 0x58, progress),
+      ];
+
+      const grad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+      grad.addColorStop(0.00, rgb(top[0], top[1], top[2]));
+      grad.addColorStop(0.55, rgb(mid[0], mid[1], mid[2]));
+      grad.addColorStop(1.00, rgb(bot[0], bot[1], bot[2]));
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    function resetGame() {
+      gameState     = 'playing';
+      elapsedTime   = 0;
+      score         = 0;
+      raindrops     = [];
+      waveTimer     = 0;
+      lastSafeLanes = [];
+      particles     = [];
+      scorePopups   = [];
+      cherries      = [];
+      cherrySpawnIn = CHERRY_SPAWN_MIN + Math.random() * (CHERRY_SPAWN_MAX - CHERRY_SPAWN_MIN);
+      powerUpTime   = 0;
+      populateClouds();
+      currentLane = 2;
+      pacX = tweenFromX = tweenToX = getLaneX(2);
+      tweenT     = TWEEN_DURATION;
+      mouthAngle = MOUTH_MAX;
+      mouthDir   = -1;
+    }
+
+    // ─── Difficulty params ────────────────────────────────────────────────────
+    // The 5-minute run is divided into 10 thirty-second steps. Each step the
+    // wave interval and rain speed advance via linear interpolation; lane counts
+    // step up at chosen boundaries so average drops-per-wave climbs smoothly.
+    function getDifficultyParams() {
+      const stepIndex = Math.min(Math.floor(elapsedTime / 30), 9);  // 0..9
+      const p = stepIndex / 9;                                       // 0..1 across run
+      let interval, rainSpeed, lanesMin, lanesMax;
+
+      if (difficulty === 'easy') {
+        // Step 0 baseline: interval 2.0s, lanes 1–2, speed 210 — matches pre-ramp Phase 1
+        interval  = 2.0 - 1.0 * p;                                                // 2.00s → 1.00s
+        rainSpeed = RAIN_SPEED_EASY_START + (RAIN_SPEED_EASY_END - RAIN_SPEED_EASY_START) * p;
+        if      (stepIndex < 3) { lanesMin = 1; lanesMax = 2; }   // 0:00–1:30 — 1–2 lanes (baseline)
+        else if (stepIndex < 6) { lanesMin = 2; lanesMax = 2; }   // 1:30–3:00 — 2 lanes
+        else                    { lanesMin = 2; lanesMax = 3; }   // 3:00–5:00 — 2–3 lanes
+      } else {
+        // Step 0 baseline: interval 1.5s, lanes 1–2, speed 280 — matches pre-ramp Phase 1
+        interval  = 1.5 - 1.05 * p;                                               // 1.50s → 0.45s
+        rainSpeed = RAIN_SPEED_HARD_START + (RAIN_SPEED_HARD_END - RAIN_SPEED_HARD_START) * p;
+        if      (stepIndex < 2) { lanesMin = 1; lanesMax = 2; }   // 0:00–1:00 — 1–2 lanes (baseline)
+        else if (stepIndex < 5) { lanesMin = 2; lanesMax = 3; }   // 1:00–2:30 — 2–3 lanes
+        else if (stepIndex < 7) { lanesMin = 3; lanesMax = 3; }   // 2:30–3:30 — 3 lanes
+        else                    { lanesMin = 3; lanesMax = 4; }   // 3:30–5:00 — 3–4 lanes
+      }
+      return { interval, lanesMin, lanesMax, rainSpeed };
+    }
+
+    function startGame(diff) {
+      difficulty = diff;
+      resetGame();  // sets gameState = 'playing'
+    }
+
+    // ─── Collision ────────────────────────────────────────────────────────────
+    // Two AABB hit zones: Pac-Man's body AND the parachute canopy. Acid rain that
+    // touches either ends the run. The cord region between them is intentionally
+    // not checked (cords are 1px lines).
+    function aabbHitsDrop(box, dx, dropY) {
+      const dLeft  = dx     - RAIN_WIDTH  / 2;
+      const dRight = dx     + RAIN_WIDTH  / 2;
+      const dTop   = dropY  - RAIN_HEIGHT / 2;
+      const dBot   = dropY  + RAIN_HEIGHT / 2;
+      return box.left < dRight && box.right > dLeft && box.top < dBot && box.bot > dTop;
+    }
+
+    function checkCollisions() {
+      const pacY = getPacY();
+
+      // Pac-Man body (existing)
+      const bodyBox = {
+        left:  pacX - HIT_HALF,
+        right: pacX + HIT_HALF,
+        top:   pacY - HIT_HALF,
+        bot:   pacY + HIT_HALF,
+      };
+
+      // Parachute canopy — geometry mirrors drawParachute()
+      const canopyRadius = PAC_RADIUS * 1.6;
+      const canopyBaseY  = pacY - PAC_RADIUS - 6;
+      const paraHalfW    = canopyRadius * 0.82;  // slightly tighter than visual for fairness
+      const paraBox = {
+        left:  pacX - paraHalfW,
+        right: pacX + paraHalfW,
+        top:   canopyBaseY - canopyRadius,
+        bot:   canopyBaseY,
+      };
+
+      // Reverse iterate so we can splice when eating drops during a power-up
+      const poweredUp = powerUpTime > 0;
+      for (let i = raindrops.length - 1; i >= 0; i--) {
+        const drop = raindrops[i];
+        const dx   = getLaneX(drop.lane);
+        const bodyHit = aabbHitsDrop(bodyBox, dx, drop.y);
+        // Parachute is shed during power-up, so its hit zone is only live when it's drawn.
+        const paraHit = !poweredUp && aabbHitsDrop(paraBox, dx, drop.y);
+        if (bodyHit || paraHit) {
+          if (poweredUp) {
+            // Cherry power-up: eat the drop, gain bonus points
+            raindrops.splice(i, 1);
+            score += POWER_UP_RAIN_BONUS;
+            spawnScorePopup(`+${POWER_UP_RAIN_BONUS}`, '#7FFF00');
+          } else {
+            gameState = 'gameover';
+            spawnDeathParticles();
+            return;
+          }
+        }
+      }
+    }
+
+    // ─── Update ───────────────────────────────────────────────────────────────
+    function update(dt) {
+      // Polish layers run regardless of game state so they animate on every screen
+      updateClouds(dt);
+      updateParticles(dt);
+      updateScorePopups(dt);
+
+      if (gameState !== 'playing') return;  // paused / gameover / win all skip game logic
+
+      elapsedTime += dt;
+      score       += SCORE_RATE * dt;
+      if (score >= WIN_SCORE) {
+        score     = WIN_SCORE;
+        gameState = 'win';
+        return;
+      }
+
+      // Advance lane-switch tween using smoothstep easing
+      if (tweenT < TWEEN_DURATION) {
+        tweenT = Math.min(tweenT + dt, TWEEN_DURATION);
+        const t = tweenT / TWEEN_DURATION;
+        const eased = t * t * (3 - 2 * t);  // smoothstep: ease in-out
+        pacX = tweenFromX + (tweenToX - tweenFromX) * eased;
+      }
+
+      // Oscillate mouth angle between MOUTH_MIN and MOUTH_MAX
+      mouthAngle += mouthDir * MOUTH_SPEED * dt;
+      if (mouthAngle <= MOUTH_MIN) {
+        mouthAngle = MOUTH_MIN;
+        mouthDir = 1;
+      } else if (mouthAngle >= MOUTH_MAX) {
+        mouthAngle = MOUTH_MAX;
+        mouthDir = -1;
+      }
+
+      // Wave timer: spawn on the interval for the current difficulty
+      const params = getDifficultyParams();
+      waveTimer += dt;
+      if (waveTimer >= params.interval) {
+        waveTimer -= params.interval;
+        spawnWave(params.lanesMin, params.lanesMax);
+      }
+
+      // Move all drops downward; remove any that have left the bottom of the screen
+      for (const drop of raindrops) {
+        drop.y += params.rainSpeed * dt;
+      }
+      raindrops = raindrops.filter(drop => drop.y - RAIN_HEIGHT / 2 < canvas.height);
+
+      // ─── Cherry power-up tick ──────────────────────────────────────────
+      powerUpTime = Math.max(0, powerUpTime - dt);
+
+      // Cherry spawn at a fixed cadence (independent of difficulty)
+      cherrySpawnIn -= dt;
+      if (cherrySpawnIn <= 0) {
+        cherries.push({ lane: Math.floor(Math.random() * LANE_COUNT), y: -CHERRY_RADIUS });
+        cherrySpawnIn = CHERRY_SPAWN_MIN + Math.random() * (CHERRY_SPAWN_MAX - CHERRY_SPAWN_MIN);
+      }
+
+      for (const c of cherries) c.y += CHERRY_FALL_SPEED * dt;
+      cherries = cherries.filter(c => c.y - CHERRY_RADIUS < canvas.height);
+
+      // Cherry pickup: distance check between Pac-Man and each cherry
+      const pacYNow = getPacY();
+      for (let i = cherries.length - 1; i >= 0; i--) {
+        const c   = cherries[i];
+        const cx  = getLaneX(c.lane);
+        const ddx = pacX - cx;
+        const ddy = pacYNow - c.y;
+        const r   = PAC_RADIUS + CHERRY_RADIUS;
+        if (ddx * ddx + ddy * ddy < r * r) {
+          cherries.splice(i, 1);
+          powerUpTime = POWER_UP_DURATION;  // re-pickups refresh the timer
+          score      += CHERRY_PICKUP_BONUS;
+          spawnScorePopup(`+${CHERRY_PICKUP_BONUS}`, '#FF6B00');
+        }
+      }
+
+      checkCollisions();
+    }
+
+    // ─── Draw helpers ────────────────────────────────────────────────────────
+
+    function drawLaneGuides() {
+      const laneWidth = canvas.width / LANE_COUNT;
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+      ctx.lineWidth   = 1.5;
+      ctx.setLineDash([8, 8]);   // retro-arcade dashed lane dividers
+      for (let i = 1; i < LANE_COUNT; i++) {
+        const x = laneWidth * i;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function drawParachute(x, y) {
+      const canopyRadius = PAC_RADIUS * 1.6;
+      // Canopy base sits just above Pac-Man's top edge
+      const canopyBaseY  = y - PAC_RADIUS - 6;
+
+      // Canopy: filled semicircle (flat side down)
+      ctx.beginPath();
+      ctx.arc(x, canopyBaseY, canopyRadius, Math.PI, 0);
+      ctx.closePath();
+      ctx.fillStyle   = 'rgba(210, 70, 70, 0.88)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255, 160, 160, 0.9)';
+      ctx.lineWidth   = 1.5;
+      ctx.stroke();
+
+      // Cords: 4 lines from canopy base down to Pac-Man's top region
+      // Spread across canopy width, converge toward Pac-Man center
+      const cordAttachX  = [-canopyRadius * 0.85, -canopyRadius * 0.28, canopyRadius * 0.28, canopyRadius * 0.85];
+      const cordTargetX  = [-PAC_RADIUS * 0.35, -PAC_RADIUS * 0.12, PAC_RADIUS * 0.12, PAC_RADIUS * 0.35];
+      const cordTargetY  = y - PAC_RADIUS * 0.75;
+
+      ctx.strokeStyle = 'rgba(220, 210, 190, 0.65)';
+      ctx.lineWidth   = 1;
+      for (let i = 0; i < 4; i++) {
+        ctx.beginPath();
+        ctx.moveTo(x + cordAttachX[i], canopyBaseY);
+        ctx.lineTo(x + cordTargetX[i], cordTargetY);
+        ctx.stroke();
+      }
+    }
+
+    // Teardrop silhouette: pointed top (motion direction), rounded bottom
+    function drawTeardrop(x, y, w, h) {
+      ctx.beginPath();
+      ctx.moveTo(x, y - h / 2);
+      ctx.bezierCurveTo(x + w / 2, y - h * 0.20, x + w / 2, y + h * 0.30, x, y + h / 2);
+      ctx.bezierCurveTo(x - w / 2, y + h * 0.30, x - w / 2, y - h * 0.20, x, y - h / 2);
+      ctx.closePath();
+    }
+
+    function drawRaindrops() {
+      // Body fill with green glow
+      ctx.save();
+      ctx.shadowColor = RAIN_GLOW;
+      ctx.shadowBlur  = 10;
+      ctx.fillStyle   = RAIN_COLOR;
+      for (const drop of raindrops) {
+        const x = getLaneX(drop.lane);
+        drawTeardrop(x, drop.y, RAIN_WIDTH, RAIN_HEIGHT);
+        ctx.fill();
+      }
+      ctx.restore();
+
+      // Wet-look highlight on each drop (no glow, drawn on top)
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
+      for (const drop of raindrops) {
+        const x = getLaneX(drop.lane);
+        ctx.beginPath();
+        ctx.ellipse(x - RAIN_WIDTH * 0.16, drop.y, RAIN_WIDTH * 0.16, RAIN_HEIGHT * 0.18, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // Classic Pac-Man cherry: two red spheres on green stems with a leaf
+    function drawCherry(x, y) {
+      const r = CHERRY_RADIUS * 0.8;
+      // Stems (curve up from each cherry to the leaf)
+      ctx.strokeStyle = '#3a8a3a';
+      ctx.lineWidth   = 2;
+      ctx.beginPath();
+      ctx.moveTo(x - r * 0.4, y - r * 0.6);
+      ctx.quadraticCurveTo(x - r * 0.1, y - r * 1.8, x + r * 0.3, y - r * 1.6);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x + r * 0.4, y - r * 0.6);
+      ctx.quadraticCurveTo(x + r * 0.6, y - r * 1.4, x + r * 0.3, y - r * 1.6);
+      ctx.stroke();
+      // Leaf
+      ctx.fillStyle = '#4caf50';
+      ctx.beginPath();
+      ctx.ellipse(x + r * 0.7, y - r * 1.6, r * 0.55, r * 0.22, -0.5, 0, Math.PI * 2);
+      ctx.fill();
+      // Cherries
+      ctx.fillStyle = '#e02020';
+      ctx.beginPath(); ctx.arc(x - r * 0.6, y, r, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(x + r * 0.6, y, r, 0, Math.PI * 2); ctx.fill();
+      // Cartoon shine highlights
+      ctx.fillStyle = 'rgba(255,255,255,0.55)';
+      ctx.beginPath(); ctx.arc(x - r * 0.85, y - r * 0.35, r * 0.28, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(x + r * 0.35, y - r * 0.35, r * 0.28, 0, Math.PI * 2); ctx.fill();
+    }
+
+    function drawCherries() {
+      for (const c of cherries) drawCherry(getLaneX(c.lane), c.y);
+    }
+
+    function drawPacMan(x, y, facingAngle = 0) {
+      // Body: yellow filled arc with mouth wedge cut out at `facingAngle` radians
+      // (0 = right, -π/2 = up, π = left, π/2 = down)
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.arc(x, y, PAC_RADIUS, facingAngle + mouthAngle, facingAngle + 2 * Math.PI - mouthAngle);
+      ctx.closePath();
+      ctx.fillStyle = PAC_COLOR;
+      ctx.fill();
+
+      // Eye rotates with the body (default offset 0.2r right, 0.45r up from center)
+      const cosA = Math.cos(facingAngle);
+      const sinA = Math.sin(facingAngle);
+      const eyeX = x + (PAC_RADIUS * 0.2) * cosA - (-PAC_RADIUS * 0.45) * sinA;
+      const eyeY = y + (PAC_RADIUS * 0.2) * sinA + (-PAC_RADIUS * 0.45) * cosA;
+      ctx.beginPath();
+      ctx.arc(eyeX, eyeY, PAC_RADIUS * 0.1, 0, 2 * Math.PI);
+      ctx.fillStyle = '#000';
+      ctx.fill();
+    }
+
+    // ─── HUD ──────────────────────────────────────────────────────────────────
+    // Arcade-style: chunky monospace with a 1px black shadow underneath
+    // for legibility against any background.
+    function drawHUD() {
+      ctx.font         = 'bold 26px monospace';
+      ctx.textBaseline = 'top';
+
+      const drawShadowed = (text, x, y, color) => {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.fillText(text, x + 2, y + 2);
+        ctx.fillStyle = color;
+        ctx.fillText(text, x, y);
+      };
+
+      ctx.textAlign = 'left';
+      drawShadowed(`SCORE ${Math.floor(score)}`, 18, 14, '#FFE000');
+
+      ctx.textAlign = 'right';
+      drawShadowed(`TIME ${formatTime(elapsedTime)}`, canvas.width - 18, 14, '#FFFFFF');
+
+      ctx.textAlign = 'center';
+      const diffColor = difficulty === 'easy' ? '#3affa0' : '#ff5050';
+      drawShadowed(difficulty.toUpperCase(), canvas.width / 2, 14, diffColor);
+
+      // Cherry power-up timer bar (only when active)
+      if (powerUpTime > 0) {
+        const barW = 180;
+        const barH = 10;
+        const barX = (canvas.width - barW) / 2;
+        const barY = 50;
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillRect(barX - 2, barY - 2, barW + 4, barH + 4);
+        ctx.fillStyle = '#FF6B00';
+        ctx.fillRect(barX, barY, barW * (powerUpTime / POWER_UP_DURATION), barH);
+      }
+    }
+
+    // ─── Win-screen / parallax cloud (cartoon style) ─────────────────────────
+    // Caller controls overall alpha via globalAlpha; this just draws shape + shadow.
+    function drawCloud(x, y, r) {
+      // Soft sky-tinted shadow ellipse below the cloud for cartoon depth
+      ctx.fillStyle = 'rgba(60, 90, 130, 0.28)';
+      ctx.beginPath();
+      ctx.ellipse(x, y + r * 0.55, r * 1.35, r * 0.22, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // White cloud body — 7 overlapping circles for a chunky, lumpy silhouette
+      ctx.fillStyle = '#FFFFFF';
+      ctx.beginPath(); ctx.arc(x,             y,             r * 0.65, 0, 2 * Math.PI); ctx.fill();
+      ctx.beginPath(); ctx.arc(x + r * 0.55,  y + r * 0.05,  r * 0.55, 0, 2 * Math.PI); ctx.fill();
+      ctx.beginPath(); ctx.arc(x - r * 0.55,  y + r * 0.10,  r * 0.50, 0, 2 * Math.PI); ctx.fill();
+      ctx.beginPath(); ctx.arc(x + r * 1.05,  y + r * 0.20,  r * 0.42, 0, 2 * Math.PI); ctx.fill();
+      ctx.beginPath(); ctx.arc(x - r * 1.05,  y + r * 0.18,  r * 0.42, 0, 2 * Math.PI); ctx.fill();
+      ctx.beginPath(); ctx.arc(x + r * 0.20,  y - r * 0.40,  r * 0.50, 0, 2 * Math.PI); ctx.fill();
+      ctx.beginPath(); ctx.arc(x - r * 0.35,  y - r * 0.35,  r * 0.45, 0, 2 * Math.PI); ctx.fill();
+    }
+
+    // Draws a Pac-Man family member. facingLeft flips the mouth direction; hasBow adds Ms. Pac-Man's bow.
+    function drawFamilyMember(x, y, r, facingLeft, hasBow) {
+      const ma         = MOUTH_MAX;
+      const startAngle = facingLeft ? Math.PI + ma : ma;
+      const endAngle   = facingLeft ? Math.PI - ma : 2 * Math.PI - ma;
+
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.arc(x, y, r, startAngle, endAngle);
+      ctx.closePath();
+      ctx.fillStyle = PAC_COLOR;
+      ctx.fill();
+
+      const eyeOffX = facingLeft ? -r * 0.2 : r * 0.2;
+      ctx.beginPath();
+      ctx.arc(x + eyeOffX, y - r * 0.45, r * 0.1, 0, 2 * Math.PI);
+      ctx.fillStyle = '#000';
+      ctx.fill();
+
+      if (hasBow) {
+        const bx = x + (facingLeft ? -r * 0.05 : r * 0.05);
+        const by = y - r * 0.88;
+        ctx.fillStyle = '#FF69B4';
+        ctx.beginPath(); ctx.ellipse(bx - r * 0.26, by - r * 0.12, r * 0.23, r * 0.14, -0.5, 0, 2 * Math.PI); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(bx + r * 0.26, by - r * 0.12, r * 0.23, r * 0.14,  0.5, 0, 2 * Math.PI); ctx.fill();
+        ctx.beginPath(); ctx.arc(bx, by - r * 0.12, r * 0.1, 0, 2 * Math.PI);
+        ctx.fillStyle = '#FF1493'; ctx.fill();
+      }
+    }
+
+    // ─── Win screen ───────────────────────────────────────────────────────────
+    function drawWinScreen() {
+      // Sky-blue gradient background
+      const grad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+      grad.addColorStop(0, '#4ac8f0');
+      grad.addColorStop(1, '#d0eeff');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const cx = canvas.width  / 2;
+      const cy = canvas.height / 2;
+
+      // Clouds
+      drawCloud(cx - canvas.width * 0.28, cy - 140, 52);
+      drawCloud(cx + canvas.width * 0.22, cy - 100, 40);
+      drawCloud(cx + canvas.width * 0.05, cy - 200, 46);
+
+      // Announcement
+      const fs  = Math.min(Math.floor(canvas.width / 16), 48);
+      ctx.font         = `bold ${fs}px monospace`;
+      ctx.fillStyle    = '#0a4a00';
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('YOU MADE IT HOME!', cx, cy - 140);
+
+      // Family: kid — Ms. Pac-Man — kid
+      const kidR = PAC_RADIUS * 0.58;
+      const gap  = PAC_RADIUS * 2.6;
+      drawFamilyMember(cx - gap, cy + 10, kidR,          false, false);  // kid left
+      drawFamilyMember(cx,       cy,      PAC_RADIUS * 1.1, true, true);  // Ms. Pac-Man
+      drawFamilyMember(cx + gap, cy + 10, kidR,          false, false);  // kid right
+
+      // Player Pac-Man arriving from below
+      drawPacMan(cx, cy + PAC_RADIUS * 3.8);
+
+      // Stats
+      ctx.font      = `${Math.min(22, Math.floor(canvas.width / 40))}px monospace`;
+      ctx.fillStyle = '#0a4a00';
+      ctx.fillText(`Score: ${Math.floor(score)}  |  Time: ${formatTime(elapsedTime)}`, cx, cy + 100);
+
+      // Play-again prompt
+      const pulse   = 0.5 + 0.5 * Math.sin(performance.now() / 380);
+      ctx.font      = 'bold 26px monospace';
+      ctx.fillStyle = `rgba(10, 74, 0, ${0.65 + 0.35 * pulse})`;
+      ctx.fillText('[ Press  R  to play again ]', cx, cy + 150);
+    }
+
+    // ─── Game-over screen ─────────────────────────────────────────────────────
+    function drawGameOver() {
+      // Semi-transparent dark overlay
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const cx = canvas.width  / 2;
+      const cy = canvas.height / 2;
+
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+
+      // Main announcement — scale font so the long string fits on narrow screens
+      const announceFontSize = Math.min(Math.floor(canvas.width / 22), 38);
+      ctx.font      = `bold ${announceFontSize}px monospace`;
+      ctx.fillStyle = '#FF3030';
+      ctx.fillText('YOU WERE DISSOLVED BY THE ACID RAIN', cx, cy - 70);
+
+      // Stats
+      ctx.font      = `${Math.min(22, Math.floor(canvas.width / 40))}px monospace`;
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillText(`Time survived: ${formatTime(elapsedTime)}`, cx, cy);
+      ctx.fillText(`Score: ${Math.floor(score)}`, cx, cy + 36);
+
+      // Retry prompt — pulsing yellow so it's impossible to miss
+      const pulse   = 0.5 + 0.5 * Math.sin(performance.now() / 380);
+      ctx.font      = `bold 26px monospace`;
+      ctx.fillStyle = `rgba(255, 225, 0, ${0.65 + 0.35 * pulse})`;
+      ctx.fillText('[ Press  R  to retry ]', cx, cy + 96);
+
+      // Secondary: return to main menu
+      ctx.font      = '18px monospace';
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
+      ctx.fillText('Press  M  for main menu', cx, cy + 134);
+    }
+
+    // ─── Pause overlay ────────────────────────────────────────────────────────
+    function drawPaused() {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font         = 'bold 48px monospace';
+      ctx.fillStyle    = '#FFE000';
+      ctx.fillText('PAUSED', canvas.width / 2, canvas.height / 2 - 20);
+
+      ctx.font      = '22px monospace';
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.fillText('Press P to resume', canvas.width / 2, canvas.height / 2 + 34);
+    }
+
+    // ─── Controls legend (bottom-right) ───────────────────────────────────────
+    function drawControls() {
+      const lines = [
+        '← →  Move',
+        'P      Pause',
+        'R      Retry / Play again',
+        'M      Main menu',
+      ];
+      const lineH  = 20;
+      const pad    = 14;
+      ctx.font         = '14px monospace';
+      ctx.textAlign    = 'right';
+      ctx.textBaseline = 'bottom';
+
+      lines.forEach((line, i) => {
+        const y = canvas.height - pad - (lines.length - 1 - i) * lineH;
+        // subtle shadow for legibility over any background
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillText(line, canvas.width - pad + 1, y + 1);
+        ctx.fillStyle = 'rgba(255,255,255,0.55)';
+        ctx.fillText(line, canvas.width - pad, y);
+      });
+    }
+
+    // ─── Start screen ────────────────────────────────────────────────────────
+    // Draws a rounded-rect button; returns its bounding rect for hit-testing.
+    function drawButton(label, cx, cy, w, h, baseColor, hovered) {
+      ctx.save();
+      ctx.shadowColor = baseColor;
+      ctx.shadowBlur  = hovered ? 22 : 10;
+      ctx.globalAlpha = hovered ? 1.0 : 0.82;
+      ctx.fillStyle   = baseColor;
+      ctx.beginPath();
+      ctx.roundRect(cx - w / 2, cy - h / 2, w, h, 10);
+      ctx.fill();
+      ctx.restore();
+
+      ctx.font         = 'bold 30px monospace';
+      ctx.fillStyle    = '#fff';
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, cx, cy);
+
+      return { x: cx - w / 2, y: cy - h / 2, w, h };
+    }
+
+    function drawStartScreen() {
+      // Atmospheric background + parallax clouds (same as in-game)
+      drawBackground();
+      drawBackgroundClouds();
+
+      const cx = canvas.width  / 2;
+      const cy = canvas.height / 2;
+
+      // Decorative Pac-Man + parachute (top-right)
+      const demoX = canvas.width * 0.80;
+      const demoY = canvas.height * 0.28;
+      drawParachute(demoX, demoY);
+      drawPacMan(demoX, demoY);
+
+      // Title (with arcade-marquee drop shadow)
+      const titleSize = Math.min(Math.floor(canvas.width / 14), 56);
+      ctx.font         = `bold ${titleSize}px monospace`;
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+      const titleY = canvas.height * 0.18;
+      ctx.fillStyle = 'rgba(0, 10, 30, 0.6)';
+      ctx.fillText('PAC-MAN PARACHUTE', cx + 3, titleY + 4);
+      ctx.fillStyle = PAC_COLOR;
+      ctx.fillText('PAC-MAN PARACHUTE', cx, titleY);
+
+      // Story blurb
+      ctx.font      = `${Math.min(18, Math.floor(canvas.width / 60))}px monospace`;
+      ctx.fillStyle = 'rgba(200,200,200,0.85)';
+      ctx.fillText('Pac-Man has been separated from his family,', cx, canvas.height * 0.30);
+      ctx.fillText('who waits above the clouds. His parachute', cx, canvas.height * 0.36);
+      ctx.fillText('pulls him up — dodge the acid rain to get home.', cx, canvas.height * 0.42);
+
+      // Controls hint
+      ctx.font      = '16px monospace';
+      ctx.fillStyle = 'rgba(160,255,160,0.75)';
+      ctx.fillText('← →  dodge lanes     P  pause     R  retry', cx, canvas.height * 0.52);
+
+      // Difficulty buttons
+      const btnW  = Math.min(180, canvas.width * 0.22);
+      const btnH  = 58;
+      const btnY  = canvas.height * 0.64;
+      const gap   = btnW * 0.72;
+      easyBtn = drawButton('EASY', cx - gap, btnY, btnW, btnH, '#1aaa44', hoverBtn === 'easy');
+      hardBtn = drawButton('HARD', cx + gap, btnY, btnW, btnH, '#cc2222', hoverBtn === 'hard');
+
+      // Prompt
+      ctx.font      = '18px monospace';
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.fillText('Click a difficulty to begin', cx, canvas.height * 0.76);
+    }
+
+    // ─── Start-screen mouse handlers ─────────────────────────────────────────
+    function hitRect(mx, my, r) {
+      return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
+    }
+
+    canvas.addEventListener('mousemove', (e) => {
+      if (gameState !== 'start') { canvas.style.cursor = 'default'; return; }
+      const r  = canvas.getBoundingClientRect();
+      const mx = e.clientX - r.left;
+      const my = e.clientY - r.top;
+      if      (hitRect(mx, my, easyBtn)) { hoverBtn = 'easy'; canvas.style.cursor = 'pointer'; }
+      else if (hitRect(mx, my, hardBtn)) { hoverBtn = 'hard'; canvas.style.cursor = 'pointer'; }
+      else                               { hoverBtn = null;   canvas.style.cursor = 'default';  }
+    });
+
+    canvas.addEventListener('click', (e) => {
+      if (gameState !== 'start') return;
+      const r  = canvas.getBoundingClientRect();
+      const mx = e.clientX - r.left;
+      const my = e.clientY - r.top;
+      if (hitRect(mx, my, easyBtn)) startGame('easy');
+      if (hitRect(mx, my, hardBtn)) startGame('hard');
+    });
+
+    // ─── Render ───────────────────────────────────────────────────────────────
+    function render() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (gameState === 'start') {
+        drawStartScreen();
+        return;
+      }
+
+      if (gameState === 'win') {
+        drawWinScreen();
+        return;  // win screen has its own background, clouds, family
+      }
+
+      // Atmospheric background + parallax clouds (shared by play / pause / gameover)
+      drawBackground();
+      drawBackgroundClouds();
+
+      drawLaneGuides();
+      drawRaindrops();
+      drawCherries();
+
+      const pacY = getPacY();
+
+      // Hide Pac-Man during gameover so the particle burst is the focus
+      if (gameState !== 'gameover') {
+        const isPoweredUp = powerUpTime > 0;
+        if (!isPoweredUp) {
+          drawParachute(pacX, pacY);
+          drawPacMan(pacX, pacY);
+        } else {
+          // Powered up: shed parachute, face up, glow cherry-orange.
+          // Blink the glow in the last 1.2s to warn the player.
+          const blinkOn = powerUpTime > 1.2 || Math.floor(powerUpTime * 6) % 2 === 0;
+          ctx.save();
+          ctx.shadowColor = '#FF6B00';
+          ctx.shadowBlur  = blinkOn ? 22 : 4;
+          drawPacMan(pacX, pacY, -Math.PI / 2);
+          ctx.restore();
+        }
+      }
+
+      drawParticles();
+
+      drawHUD();
+      drawScorePopups();
+      if (gameState === 'paused')   drawPaused();
+      if (gameState === 'gameover') drawGameOver();
+
+      drawControls();
+    }
+
+    // ─── Game loop ────────────────────────────────────────────────────────────
+    let lastTime = null;
+
+    function loop(timestamp) {
+      if (lastTime === null) lastTime = timestamp;
+      const dt = Math.min((timestamp - lastTime) / 1000, 0.05);  // cap dt to avoid huge jumps on tab refocus
+      lastTime = timestamp;
+
+      update(dt);
+      render();
+      requestAnimationFrame(loop);
+    }
+
+    populateClouds();          // initial cloud population for the start screen
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
